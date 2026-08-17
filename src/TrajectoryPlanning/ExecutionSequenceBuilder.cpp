@@ -1,0 +1,198 @@
+#include <RotationBodyTrajectoryPlanning/TrajectoryPlanning/ExecutionSequenceBuilder.h>
+
+#include <RotationBodyTrajectoryPlanning/TrajectoryPlanning/TrajectoryGroupEditor.h>
+
+#include <Eigen/Geometry>
+
+#include <algorithm>
+#include <cmath>
+
+namespace smrobot::spray::rotationbody
+{
+    namespace
+    {
+        constexpr double kSafetyAngularSpeedRadiansPerSecond =
+            100.0 * 3.14159265358979323846 / 180.0;
+        constexpr double kPoseTolerance = 1.0e-9;
+
+        const TrajectoryPass* sequencePass(
+            const PublishedTrajectoryPlan& plan,
+            const RapidSequenceEntry& entry)
+        {
+            return entry.kind == RapidSequenceEntryKind::Trajectory
+                ? TrajectoryGroupEditor::find(plan.group, entry.trajectoryPassId)
+                : nullptr;
+        }
+
+        double transferDuration(
+            const Eigen::Isometry3d& from,
+            const Eigen::Isometry3d& to,
+            double linearSpeedMetersPerSecond)
+        {
+            const double linearSeconds =
+                (to.translation() - from.translation()).norm() /
+                linearSpeedMetersPerSecond;
+            const Eigen::AngleAxisd rotation(from.linear().transpose() * to.linear());
+            const double angularSeconds =
+                std::abs(rotation.angle()) / kSafetyAngularSpeedRadiansPerSecond;
+            return std::max(linearSeconds, angularSeconds);
+        }
+
+        bool samePose(
+            const Eigen::Isometry3d& lhs,
+            const Eigen::Isometry3d& rhs)
+        {
+            return lhs.translation().isApprox(rhs.translation(), kPoseTolerance) &&
+                lhs.linear().isApprox(rhs.linear(), kPoseTolerance);
+        }
+
+        PlanningResult<Eigen::Matrix3d> firstSafetyOrientation(
+            const PublishedTrajectoryPlan& plan,
+            std::size_t safetyIndex)
+        {
+            for(std::size_t index = safetyIndex + 1;
+                index < plan.executionSequence.size();
+                ++index) {
+                if(const TrajectoryPass* pass =
+                    sequencePass(plan, plan.executionSequence[index])) {
+                    if(pass->trajectory.hasValidPoints()) {
+                        return PlanningResult<Eigen::Matrix3d>::success(
+                            (plan.baseFromPlanning *
+                                pass->trajectory.linearPoints.front().planningFromTool).linear());
+                    }
+                }
+            }
+            return PlanningResult<Eigen::Matrix3d>::failure(
+                PlanningErrorCode::InvalidArgument,
+                "The first safety point requires a following trajectory.");
+        }
+    }
+
+    PlanningResult<TimedExecutionTargets> ExecutionSequenceBuilder::build(
+        const PublishedTrajectoryPlan& plan,
+        const Eigen::Isometry3d& initialBaseFromTool)
+    {
+        if(plan.executionSequence.empty() ||
+            !initialBaseFromTool.matrix().allFinite() ||
+            !plan.baseFromPlanning.matrix().allFinite() ||
+            !plan.safetyPositionBaseMeters.allFinite() ||
+            !std::isfinite(plan.safetySpeedMetersPerSecond) ||
+            plan.safetySpeedMetersPerSecond <= 0.0) {
+            return PlanningResult<TimedExecutionTargets>::failure(
+                PlanningErrorCode::InvalidArgument,
+                "The execution sequence or safety motion settings are invalid.");
+        }
+        const PlanningResult<void> validation =
+            TrajectoryGroupEditor::validate(plan.group);
+        if(!validation) {
+            return PlanningResult<TimedExecutionTargets>::failure(
+                validation.error.code,
+                validation.error.message);
+        }
+
+        TimedExecutionTargets targets;
+        targets.reserve(plan.executionSequence.size() * 2 + 1);
+        TimedExecutionTarget initial;
+        initial.baseFromTool = initialBaseFromTool;
+        targets.push_back(initial);
+
+        double timeSeconds = 0.0;
+        Eigen::Isometry3d current = initialBaseFromTool;
+        bool hasTrajectoryTarget = false;
+        const auto appendTransfer = [&](
+            const Eigen::Isometry3d& pose,
+            TimedExecutionTargetKind kind,
+            const std::string& passId,
+            TimedExecutionTargets& output,
+            double& time,
+            Eigen::Isometry3d& previous) {
+            if(samePose(previous, pose)) {
+                return;
+            }
+            time += transferDuration(
+                previous, pose, plan.safetySpeedMetersPerSecond);
+            TimedExecutionTarget target;
+            target.timeSeconds = time;
+            target.baseFromTool = pose;
+            target.kind = kind;
+            target.trajectoryPassId = passId;
+            output.push_back(std::move(target));
+            previous = pose;
+        };
+
+        for(std::size_t sequenceIndex = 0;
+            sequenceIndex < plan.executionSequence.size();
+            ++sequenceIndex) {
+            const RapidSequenceEntry& entry = plan.executionSequence[sequenceIndex];
+            if(entry.kind == RapidSequenceEntryKind::SafetyPoint) {
+                Eigen::Isometry3d safetyPose = Eigen::Isometry3d::Identity();
+                safetyPose.translation() = plan.safetyPositionBaseMeters;
+                if(hasTrajectoryTarget) {
+                    safetyPose.linear() = current.linear();
+                } else {
+                    const PlanningResult<Eigen::Matrix3d> orientation =
+                        firstSafetyOrientation(plan, sequenceIndex);
+                    if(!orientation) {
+                        return PlanningResult<TimedExecutionTargets>::failure(
+                            orientation.error.code,
+                            orientation.error.message);
+                    }
+                    safetyPose.linear() = orientation.value;
+                }
+                appendTransfer(
+                    safetyPose,
+                    TimedExecutionTargetKind::SafetyPoint,
+                    {},
+                    targets,
+                    timeSeconds,
+                    current);
+                continue;
+            }
+
+            const TrajectoryPass* pass = sequencePass(plan, entry);
+            if(pass == nullptr || !pass->trajectory.hasValidPoints()) {
+                return PlanningResult<TimedExecutionTargets>::failure(
+                    PlanningErrorCode::InvalidArgument,
+                    "The execution sequence references a missing trajectory.");
+            }
+            const Eigen::Isometry3d start = plan.baseFromPlanning *
+                pass->trajectory.linearPoints.front().planningFromTool;
+            appendTransfer(
+                start,
+                TimedExecutionTargetKind::Trajectory,
+                entry.trajectoryPassId,
+                targets,
+                timeSeconds,
+                current);
+            const double passStartTime = timeSeconds;
+            for(std::size_t pointIndex = 1;
+                pointIndex < pass->trajectory.linearPoints.size();
+                ++pointIndex) {
+                const TrajectoryPosePoint& point =
+                    pass->trajectory.linearPoints[pointIndex];
+                TimedExecutionTarget target;
+                target.timeSeconds = passStartTime + point.timeSeconds;
+                target.baseFromTool = plan.baseFromPlanning * point.planningFromTool;
+                target.kind = TimedExecutionTargetKind::Trajectory;
+                target.trajectoryPassId = entry.trajectoryPassId;
+                targets.push_back(std::move(target));
+            }
+            current = plan.baseFromPlanning *
+                pass->trajectory.linearPoints.back().planningFromTool;
+            timeSeconds = passStartTime + pass->trajectory.metrics.durationSeconds;
+            hasTrajectoryTarget = true;
+
+            if(pass->transitionAfterSeconds > 0.0) {
+                timeSeconds += pass->transitionAfterSeconds;
+                TimedExecutionTarget hold;
+                hold.timeSeconds = timeSeconds;
+                hold.baseFromTool = current;
+                hold.kind = TimedExecutionTargetKind::Trajectory;
+                hold.trajectoryPassId = entry.trajectoryPassId;
+                targets.push_back(std::move(hold));
+            }
+        }
+
+        return PlanningResult<TimedExecutionTargets>::success(std::move(targets));
+    }
+}
