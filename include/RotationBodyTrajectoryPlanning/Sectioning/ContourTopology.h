@@ -7,6 +7,10 @@
 #include <cstddef>
 #include <vector>
 
+
+
+
+
 namespace smrobot::spray::rotationbody
 {
     struct YzSegment
