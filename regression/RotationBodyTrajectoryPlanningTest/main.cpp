@@ -1221,6 +1221,14 @@ namespace
                     expectedSpray,
                     1.0e-9),
                     "swapping A/B preserves the physical spray direction");
+                expect(
+                    reversedTilted.value.linearPoints.front().planningFromTool.linear().isApprox(
+                        tilted.value.linearPoints.back().planningFromTool.linear(),
+                        1.0e-9) &&
+                    reversedTilted.value.linearPoints.back().planningFromTool.linear().isApprox(
+                        tilted.value.linearPoints.front().planningFromTool.linear(),
+                        1.0e-9),
+                    "reversing generation preserves the complete tool orientation");
             }
         }
         bool timestampsMatch = true;
@@ -1233,11 +1241,19 @@ namespace
         expect(timestampsMatch,
             "relative helical points preserve every linear trajectory timestamp");
 
+        const Eigen::Matrix3d forwardStartOrientation =
+            trajectory.linearPoints.front().planningFromTool.linear();
+        const Eigen::Matrix3d forwardEndOrientation =
+            trajectory.linearPoints.back().planningFromTool.linear();
         expect(rotationbody::TrajectoryEditor::swapDirection(trajectory).ok(),
             "trajectory direction can be swapped");
         expect(trajectory.parameters.reversed &&
-            near(trajectory.linearPoints.front().planningFromTool.translation().z(), 0.0),
-            "swapping exchanges A and B while preserving a valid trajectory");
+            near(trajectory.linearPoints.front().planningFromTool.translation().z(), 0.0) &&
+            trajectory.linearPoints.front().planningFromTool.linear().isApprox(
+                forwardEndOrientation, 1.0e-9) &&
+            trajectory.linearPoints.back().planningFromTool.linear().isApprox(
+                forwardStartOrientation, 1.0e-9),
+            "swapping exchanges A and B without changing tool orientation");
 
         const std::size_t previousCount = trajectory.linearPoints.size();
         expect(rotationbody::TrajectoryEditor::interpolateRange(
@@ -1419,6 +1435,43 @@ namespace
                 forwardEnd.linear().isApprox(reverseEnd.linear(), 1.0e-9),
                 "coincident reverse pass inherits the previous tool orientation");
         }
+
+        // Projects saved before return-pass orientation continuity was fixed
+        // contain X/Y axes flipped by 180 degrees around the spray Z axis.
+        // Motion Planning must normalize that legacy representation too.
+        rotationbody::TrajectoryPass legacyReturnPass = returnPass;
+        for(auto& point : legacyReturnPass.trajectory.linearPoints) {
+            point.planningFromTool.linear().col(0) *= -1.0;
+            point.planningFromTool.linear().col(1) *= -1.0;
+        }
+        rotationbody::PublishedTrajectoryPlan legacyReturnPlan = returnPlan;
+        legacyReturnPlan.group.passes = { firstPass, legacyReturnPass };
+        legacyReturnPlan.executionSequence = returnSequence;
+        legacyReturnPlan.safetyPositionBaseMeters = settings.safetyPositionBaseMeters;
+        legacyReturnPlan.safetySpeedMetersPerSecond = 0.05;
+        const Eigen::Isometry3d returnStart = legacyReturnPlan.baseFromPlanning *
+            firstPass.trajectory.linearPoints.front().planningFromTool;
+        const Eigen::Matrix3d expectedReturnOrientation =
+            (legacyReturnPlan.baseFromPlanning *
+                firstPass.trajectory.linearPoints.back().planningFromTool).linear();
+        const auto legacyTimedReturn = rotationbody::ExecutionSequenceBuilder::build(
+            legacyReturnPlan,
+            returnStart);
+        bool foundLegacyReturnTarget = false;
+        bool legacyReturnOrientationContinuous = true;
+        if(legacyTimedReturn) {
+            for(const auto& target : legacyTimedReturn.value) {
+                if(target.trajectoryPassId != legacyReturnPass.id) continue;
+                foundLegacyReturnTarget = true;
+                legacyReturnOrientationContinuous =
+                    legacyReturnOrientationContinuous &&
+                    target.baseFromTool.linear().isApprox(
+                        expectedReturnOrientation, 1.0e-9);
+            }
+        }
+        expect(legacyTimedReturn.ok() && foundLegacyReturnTarget &&
+            legacyReturnOrientationContinuous,
+            "motion execution removes the legacy 180-degree return-pass rotation");
 
         rotationbody::TrajectoryPass thirdPass = firstPass;
         thirdPass.id = "trajectory-3";

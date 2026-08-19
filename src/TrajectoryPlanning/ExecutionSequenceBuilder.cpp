@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <optional>
 
 namespace smrobot::spray::rotationbody
 {
@@ -14,6 +15,7 @@ namespace smrobot::spray::rotationbody
         constexpr double kSafetyAngularSpeedRadiansPerSecond =
             100.0 * 3.14159265358979323846 / 180.0;
         constexpr double kPoseTolerance = 1.0e-9;
+        constexpr double kReturnPathTolerance = 1.0e-7;
 
         const TrajectoryPass* sequencePass(
             const PublishedTrajectoryPlan& plan,
@@ -44,6 +46,39 @@ namespace smrobot::spray::rotationbody
         {
             return lhs.translation().isApprox(rhs.translation(), kPoseTolerance) &&
                 lhs.linear().isApprox(rhs.linear(), kPoseTolerance);
+        }
+
+        bool isCoincidentReversePass(
+            const TrajectoryPass& previous,
+            const TrajectoryPass& candidate)
+        {
+            if(!previous.trajectory.hasValidPoints() ||
+                !candidate.trajectory.hasValidPoints()) {
+                return false;
+            }
+            const TrajectoryPosePoint& previousStart =
+                previous.trajectory.linearPoints.front();
+            const TrajectoryPosePoint& previousEnd =
+                previous.trajectory.linearPoints.back();
+            const TrajectoryPosePoint& candidateStart =
+                candidate.trajectory.linearPoints.front();
+            const TrajectoryPosePoint& candidateEnd =
+                candidate.trajectory.linearPoints.back();
+            const bool endpointsReversed =
+                (previousEnd.planningFromTool.translation() -
+                    candidateStart.planningFromTool.translation()).norm() <=
+                    kReturnPathTolerance &&
+                (previousStart.planningFromTool.translation() -
+                    candidateEnd.planningFromTool.translation()).norm() <=
+                    kReturnPathTolerance;
+            const bool sprayAxesMatch =
+                previousEnd.planningFromTool.linear().col(2).isApprox(
+                    candidateStart.planningFromTool.linear().col(2),
+                    kReturnPathTolerance) &&
+                previousStart.planningFromTool.linear().col(2).isApprox(
+                    candidateEnd.planningFromTool.linear().col(2),
+                    kReturnPathTolerance);
+            return endpointsReversed && sprayAxesMatch;
         }
 
         PlanningResult<Eigen::Matrix3d> firstSafetyOrientation(
@@ -99,6 +134,7 @@ namespace smrobot::spray::rotationbody
         double timeSeconds = 0.0;
         Eigen::Isometry3d current = initialBaseFromTool;
         bool hasTrajectoryTarget = false;
+        const TrajectoryPass* previousTrajectoryPass = nullptr;
         const auto appendTransfer = [&](
             const Eigen::Isometry3d& pose,
             TimedExecutionTargetKind kind,
@@ -146,6 +182,7 @@ namespace smrobot::spray::rotationbody
                     targets,
                     timeSeconds,
                     current);
+                previousTrajectoryPass = nullptr;
                 continue;
             }
 
@@ -157,8 +194,17 @@ namespace smrobot::spray::rotationbody
             }
             const Eigen::Isometry3d start = plan.baseFromPlanning *
                 pass->trajectory.linearPoints.front().planningFromTool;
+            const std::optional<Eigen::Matrix3d> returnOrientation =
+                previousTrajectoryPass != nullptr &&
+                    isCoincidentReversePass(*previousTrajectoryPass, *pass)
+                ? std::optional<Eigen::Matrix3d>(current.linear())
+                : std::nullopt;
+            Eigen::Isometry3d continuousStart = start;
+            if(returnOrientation) {
+                continuousStart.linear() = *returnOrientation;
+            }
             appendTransfer(
-                start,
+                continuousStart,
                 TimedExecutionTargetKind::Trajectory,
                 entry.trajectoryPassId,
                 targets,
@@ -173,14 +219,21 @@ namespace smrobot::spray::rotationbody
                 TimedExecutionTarget target;
                 target.timeSeconds = passStartTime + point.timeSeconds;
                 target.baseFromTool = plan.baseFromPlanning * point.planningFromTool;
+                if(returnOrientation) {
+                    target.baseFromTool.linear() = *returnOrientation;
+                }
                 target.kind = TimedExecutionTargetKind::Trajectory;
                 target.trajectoryPassId = entry.trajectoryPassId;
                 targets.push_back(std::move(target));
             }
             current = plan.baseFromPlanning *
                 pass->trajectory.linearPoints.back().planningFromTool;
+            if(returnOrientation) {
+                current.linear() = *returnOrientation;
+            }
             timeSeconds = passStartTime + pass->trajectory.metrics.durationSeconds;
             hasTrajectoryTarget = true;
+            previousTrajectoryPass = pass;
 
             if(pass->transitionAfterSeconds > 0.0) {
                 timeSeconds += pass->transitionAfterSeconds;

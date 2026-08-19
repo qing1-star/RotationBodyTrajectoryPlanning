@@ -133,8 +133,6 @@ namespace smrobot::spray::rotationbody
         std::reverse(trajectory.linearPoints.begin(), trajectory.linearPoints.end());
         for(TrajectoryPosePoint& point : trajectory.linearPoints) {
             point.timeSeconds = duration - point.timeSeconds;
-            point.planningFromTool.linear().col(0) *= -1.0;
-            point.planningFromTool.linear().col(1) *= -1.0;
         }
         std::swap(trajectory.targetSurfaceStart, trajectory.targetSurfaceEnd);
         trajectory.parameters.reversed = !trajectory.parameters.reversed;
