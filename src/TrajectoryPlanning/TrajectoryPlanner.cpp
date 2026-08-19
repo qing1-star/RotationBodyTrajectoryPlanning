@@ -144,7 +144,11 @@ namespace smrobot::spray::rotationbody
                 "The generated trajectory start and end positions coincide.");
         }
 
-        Eigen::Vector3d toolX = movement - movement.dot(sprayDirection) * sprayDirection;
+        // Reversing a pass changes only its travel direction.  Keep the tool
+        // frame tied to the canonical boundary direction so a return pass
+        // does not introduce a 180-degree roll around the spray axis.
+        Eigen::Vector3d toolX = canonicalTangent -
+            canonicalTangent.dot(sprayDirection) * sprayDirection;
         if(toolX.norm() <= epsilon) {
             return PlanningResult<PlannedTrajectory>::failure(
                 PlanningErrorCode::DegenerateGeometry,
