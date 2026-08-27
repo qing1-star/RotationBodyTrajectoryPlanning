@@ -12,9 +12,10 @@
 #include <RotationBodyTrajectoryPlanning/TrajectoryPlanning/TrajectoryEditor.h>
 #include <RotationBodyTrajectoryPlanning/TrajectoryPlanning/ExecutionSequenceBuilder.h>
 #include <RotationBodyTrajectoryPlanning/TrajectoryPlanning/TrajectoryGroupEditor.h>
+#include <RotationBodyTrajectoryPlanning/TrajectoryPlanning/MergedTrajectoryTextExporter.h>
 #include <RotationBodyTrajectoryPlanning/TrajectoryPlanning/TrajectoryPlanner.h>
-#include <RotationBodyTrajectoryPlanning/ABBTranslation/RapidModuleGenerator.h>
-#include <RotationBodyTrajectoryPlanning/Calibration/WorkpieceCalibration.h>
+#include <CalibrationInstructionTranslation/ABBTranslation/RapidModuleGenerator.h>
+#include <CalibrationInstructionTranslation/Calibration/WorkpieceCalibration.h>
 
 #include <Eigen/Core>
 #include <Eigen/Geometry>
@@ -1587,6 +1588,44 @@ namespace
                 "independent pass keeps its own orientation");
         }
     }
+
+    void testMergedTrajectoryTextExport()
+    {
+        rotationbody::PlannedTrajectory trajectory;
+        trajectory.parameters.positionerRpm = 10.0;
+        rotationbody::TrajectoryPosePoint first;
+        first.timeSeconds = 0.0;
+        first.planningFromTool.translation() = Eigen::Vector3d(0.1, 0.0, 0.0);
+        rotationbody::TrajectoryPosePoint second = first;
+        second.timeSeconds = 1.0;
+        trajectory.linearPoints = { first, second };
+        expect(rotationbody::TrajectoryEditor::rebuildDerived(trajectory).ok(),
+            "helical trajectory can be rebuilt for text export");
+
+        rotationbody::TrajectoryGroup group;
+        group.passes.push_back({ "trajectory-1", 1, true, 0.0, 0.0, trajectory });
+        expect(rotationbody::TrajectoryGroupEditor::refreshSchedule(group).ok(),
+            "trajectory group can be scheduled for text export");
+
+        rotationbody::PublishedTrajectoryPlan plan;
+        plan.objectId = "fixture";
+        plan.baseFromPlanning.translation() = Eigen::Vector3d(1.0, 2.0, 3.0);
+        plan.group = group;
+        const auto formatted = rotationbody::MergedTrajectoryTextExporter::format(plan);
+        expect(formatted.ok(), "trajectory group formats as matrix text");
+        if(!formatted) {
+            return;
+        }
+        expect(formatted.value.find(
+                "1.000000, 0.000000, 0.000000, 1100.000000") != std::string::npos,
+            "text export writes base-frame translations in millimeters");
+        expect(formatted.value.find(
+                "0.500000, -0.866025, 0.000000, 1050.000000") != std::string::npos,
+            "text export writes the positioner-derived helical rotation");
+        expect(formatted.value.find("\n0.000000\n\n") != std::string::npos &&
+                formatted.value.find("\n1.000000\n") != std::string::npos,
+            "text export writes each trajectory timestamp after its matrix");
+    }
 }
 
 int main(int argc, char** argv)
@@ -1617,6 +1656,7 @@ int main(int argc, char** argv)
     {
         testTrajectoryPlanningAndEditing();
         testTrajectoryGroupAndRapidTranslation();
+        testMergedTrajectoryTextExport();
         if (failureCount != 0)
         {
             std::cerr << failureCount << " trajectory regression checks failed.\n";
@@ -1638,6 +1678,7 @@ int main(int argc, char** argv)
     testWorkpieceCalibration();
     testTrajectoryPlanningAndEditing();
     testTrajectoryGroupAndRapidTranslation();
+    testMergedTrajectoryTextExport();
 
     if (failureCount != 0)
     {

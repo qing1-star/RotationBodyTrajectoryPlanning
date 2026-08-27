@@ -20,10 +20,9 @@ set(SOURCES
     src/TrajectoryPlanning/TrajectoryPlanner.cpp
     src/TrajectoryPlanning/TrajectoryEditor.cpp
     src/TrajectoryPlanning/RelativeHelicalTrajectoryBuilder.cpp
+    src/TrajectoryPlanning/MergedTrajectoryTextExporter.cpp
     src/TrajectoryPlanning/TrajectoryGroupEditor.cpp
     src/TrajectoryPlanning/ExecutionSequenceBuilder.cpp
-    src/ABBTranslation/RapidModuleGenerator.cpp
-    src/Calibration/WorkpieceCalibration.cpp
     src/Persistence/PublishedTrajectoryPlanStore.cpp
 )
 
@@ -43,10 +42,9 @@ set(INTERFACE_HEADERS
     include/RotationBodyTrajectoryPlanning/TrajectoryPlanning/TrajectoryPlanner.h
     include/RotationBodyTrajectoryPlanning/TrajectoryPlanning/TrajectoryEditor.h
     include/RotationBodyTrajectoryPlanning/TrajectoryPlanning/RelativeHelicalTrajectoryBuilder.h
+    include/RotationBodyTrajectoryPlanning/TrajectoryPlanning/MergedTrajectoryTextExporter.h
     include/RotationBodyTrajectoryPlanning/TrajectoryPlanning/TrajectoryGroupEditor.h
     include/RotationBodyTrajectoryPlanning/TrajectoryPlanning/ExecutionSequenceBuilder.h
-    include/RotationBodyTrajectoryPlanning/ABBTranslation/RapidModuleGenerator.h
-    include/RotationBodyTrajectoryPlanning/Calibration/WorkpieceCalibration.h
     include/RotationBodyTrajectoryPlanning/Persistence/PublishedTrajectoryPlanStore.h
 )
 
