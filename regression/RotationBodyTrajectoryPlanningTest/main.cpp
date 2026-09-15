@@ -1022,6 +1022,34 @@ namespace
             !rotationbody::WorkpieceCalibrationSolver::fitCircle2d(nonPlanar),
             "horizontal circle fit rejects touch points outside the Z tolerance");
 
+        const std::string modeTwoText =
+            "1418.33/4.71/731.72\n"
+            "1426.53/-25.29/731.69\n"
+            "1416.53/75.71/731.69\n"
+            "1426.34/114.39/731.60\n"
+            "1458.13/170.48/731.72\n"
+            "1494.25/206.09/731.79\n\n"
+            "1481.27/191.18/739.56\n"
+            "1457.08/191.17/1036.85\n"
+            "1116.68/191.18/1036.85\n\n"
+            "1110/44/1200\n";
+        const auto imported =
+            rotationbody::CalibrationTextParser::parseModeTwo(modeTwoText);
+        expect(imported.ok() &&
+            imported.value.circlePointsBaseMeters[0].isApprox(
+                Eigen::Vector3d(1.41833, 0.00471, 0.73172)) &&
+            imported.value.topReferenceBaseMeters.isApprox(
+                Eigen::Vector3d(1.48127, 0.19118, 0.73956)) &&
+            imported.value.safetyPositionBaseMeters.isApprox(
+                Eigen::Vector3d(1.11, 0.044, 1.2)),
+            "mode 2 TXT import maps six fit points, three references and the safety point");
+        expect(!rotationbody::CalibrationTextParser::parseModeTwo(
+                "1/2/3\n4/5/not-a-number\n"),
+            "mode 2 TXT import rejects incomplete or invalid coordinate data");
+        expect(rotationbody::CalibrationTextParser::parseModeTwo(
+                std::string("\xEF\xBB\xBF") + modeTwoText).ok(),
+            "mode 2 TXT import accepts a UTF-8 byte-order mark");
+
         rotationbody::CalibrationAxisFit axisFit;
         axisFit.mode = rotationbody::CalibrationMode::Cylinder3d;
         axisFit.axisPointBaseMeters = Eigen::Vector3d(0.5, -0.2, 1.0);
@@ -1326,34 +1354,26 @@ namespace
             settings,
             sequence);
         expect(rapid.ok(), "ABB RAPID translation accepts safety and trajectory entries");
+        expect(!rotationbody::RapidModuleGenerator::generateScheme(
+                plan, settings, sequence),
+            "SprayScheme rejects an unpaired trajectory sequence");
         if(rapid)
         {
             expect(rapid.value.code.find("MODULE SprayRotation") != std::string::npos &&
                 rapid.value.code.find("ConfJ \\Off;") != std::string::npos &&
                 rapid.value.code.find("ConfL \\Off;") != std::string::npos &&
-                rapid.value.code.find("MoveJ pSafe01,vSafeCustom,fine,penqiang;") !=
+                rapid.value.code.find("MoveJ pSafe001,vSafeCustom,fine,penqiang\\WObj:=wobj0;") !=
                     std::string::npos &&
-                rapid.value.code.find("MoveJ pPass01Start") != std::string::npos &&
-                rapid.value.code.find("MoveL pPass01End") != std::string::npos &&
-                rapid.value.code.find("PERS num nTableRPM") != std::string::npos &&
-                rapid.value.code.find("PERS num nSprayTimes:=15") != std::string::npos &&
-                rapid.value.code.find("FOR i FROM 1 TO nSprayTimes") != std::string::npos &&
-                rapid.value.code.find("! Pass1, tilt=0.000 deg, D=50.000 mm") !=
-                    std::string::npos,
-                "RAPID output disables configuration monitoring and uses the approved motion pattern");
+                rapid.value.code.find("MoveJ pTraj001Start") != std::string::npos &&
+                rapid.value.code.find("MoveL pTraj001End") != std::string::npos &&
+                rapid.value.code.find("PERS num nTableRPM") == std::string::npos &&
+                rapid.value.code.find("PROC SprayOnce()") == std::string::npos,
+                "SprayRotation preserves the direct legacy instruction format");
             expect(rapid.value.code.find("1000") != std::string::npos &&
-                rapid.value.code.find("\\WObj:=wobj0") == std::string::npos &&
+                rapid.value.code.find("\\WObj:=wobj0") != std::string::npos &&
                 rapid.value.code.find(
-                    "[9E+09,90.6655,-0.000945636,9E+09,9E+09,9E+09]") !=
-                    std::string::npos &&
-                rapid.value.code.find(
-                    "[9E+09,90.6666,-0.000918239,9E+09,9E+09,9E+09]") !=
-                    std::string::npos,
-                "RAPID poses use base coordinates, implicit wobj0 and fixed external axes");
-            const std::size_t sprayOnce = rapid.value.code.find("PROC SprayOnce()");
-            const std::size_t firstSafety = rapid.value.code.find("MoveJ pSafe01");
-            expect(sprayOnce != std::string::npos && firstSafety > sprayOnce,
-                "every repetition starts from the first safety point inside SprayOnce");
+                    "[9E9,9E9,9E9,9E9,9E9,9E9]") != std::string::npos,
+                "SprayRotation uses explicit wobj0 and legacy external axes");
             expect(rapid.value.previewSteps.size() == 3 &&
                 rapid.value.previewSteps[0].instruction == "MoveJ" &&
                 rapid.value.previewSteps[0].sourceKind ==
@@ -1362,7 +1382,7 @@ namespace
                 rapid.value.previewSteps[2].instruction == "MoveL",
                 "RAPID translation exposes safety, trajectory start and end preview steps");
             expect(rapid.value.code.find("Return") == std::string::npos,
-                "RAPID translation does not add an implicit return to each trajectory");
+                "SprayRotation does not add an implicit return to each trajectory");
             expect(rapid.value.previewSteps[0].baseFromTool.translation().isApprox(
                     settings.safetyPositionBaseMeters) &&
                 rapid.value.previewSteps[1].baseFromTool.translation().isApprox(
@@ -1509,15 +1529,15 @@ namespace
             "ABB translation accepts safety-1-2-safety-3-4 repetition order");
         if(completeRapid && completeRapid.value.previewSteps.size() == 10) {
             const std::string& code = completeRapid.value.code;
-            const std::size_t safety1 = code.find("MoveJ pSafe01");
-            const std::size_t pass1 = code.find("MoveJ pPass01Start");
-            const std::size_t pass2 = code.find("MoveJ pPass02Start");
-            const std::size_t safety2 = code.find("MoveJ pSafe02");
-            const std::size_t pass3 = code.find("MoveJ pPass03Start");
-            const std::size_t pass4 = code.find("MoveJ pPass04Start");
+            const std::size_t safety1 = code.find("MoveJ pSafe001");
+            const std::size_t pass1 = code.find("MoveJ pTraj001Start");
+            const std::size_t pass2 = code.find("MoveJ pTraj002Start");
+            const std::size_t safety2 = code.find("MoveJ pSafe002");
+            const std::size_t pass3 = code.find("MoveJ pTraj003Start");
+            const std::size_t pass4 = code.find("MoveJ pTraj004Start");
             expect(safety1 < pass1 && pass1 < pass2 && pass2 < safety2 &&
                 safety2 < pass3 && pass3 < pass4,
-                "SprayOnce preserves safety-1-2-safety-3-4 instruction order");
+                "SprayRotation preserves safety-1-2-safety-3-4 instruction order");
             expect(completeRapid.value.previewSteps[2].baseFromTool.linear().isApprox(
                     completeRapid.value.previewSteps[3].baseFromTool.linear(), 1.0e-9) &&
                 completeRapid.value.previewSteps[2].baseFromTool.linear().isApprox(
@@ -1527,6 +1547,31 @@ namespace
                 completeRapid.value.previewSteps[7].baseFromTool.linear().isApprox(
                     completeRapid.value.previewSteps[9].baseFromTool.linear(), 1.0e-9),
                 "both reversed passes return along the line without changing tool orientation");
+        }
+        const auto schemeRapid = rotationbody::RapidModuleGenerator::generateScheme(
+            completePlan, settings, completeSequence);
+        expect(schemeRapid.ok(),
+            "SprayScheme accepts two forward/return trajectory pairs");
+        if(schemeRapid) {
+            const std::string& code = schemeRapid.value.code;
+            const std::size_t main = code.find("PROC main()");
+            const std::size_t initialSafety = code.find(
+                "MoveJ pSafe01In,vSafeCustom,fine,penqiang;", main);
+            const std::size_t startTable = code.find("StartTable;", main);
+            const std::size_t sprayOnce = code.find("PROC SprayOnce()");
+            const std::size_t pair1Start = code.find("MoveJ pPass01Start", sprayOnce);
+            const std::size_t pair1End = code.find("MoveL pPass01End", sprayOnce);
+            const std::size_t pair1Return = code.find("MoveL pPass01Return", sprayOnce);
+            const std::size_t pair1Out = code.find("MoveJ pSafe01Out", sprayOnce);
+            const std::size_t pair2In = code.find("MoveJ pSafe02In", sprayOnce);
+            expect(code.find("MODULE SprayScheme") != std::string::npos &&
+                code.find("VAR speeddata vSpray01") != std::string::npos &&
+                code.find("VAR speeddata vSpray02") != std::string::npos &&
+                initialSafety < startTable &&
+                pair1Start < pair1End && pair1End < pair1Return &&
+                pair1Return < pair1Out && pair1Out < pair2In &&
+                code.find("\\WObj:=wobj0") == std::string::npos,
+                "SprayScheme emits the requested table loop and paired return format");
         }
         returnPlan.safetyPositionBaseMeters = settings.safetyPositionBaseMeters;
         returnPlan.safetySpeedMetersPerSecond = 0.05;
