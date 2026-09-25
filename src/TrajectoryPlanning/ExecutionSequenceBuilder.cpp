@@ -1,6 +1,7 @@
 #include <RotationBodyTrajectoryPlanning/TrajectoryPlanning/ExecutionSequenceBuilder.h>
 
 #include <RotationBodyTrajectoryPlanning/TrajectoryPlanning/TrajectoryGroupEditor.h>
+#include <RotationBodyTrajectoryPlanning/TrajectoryPlanning/TrajectoryPlanner.h>
 
 #include <Eigen/Geometry>
 
@@ -81,7 +82,15 @@ namespace smrobot::spray::rotationbody
             return endpointsReversed && sprayAxesMatch;
         }
 
-        PlanningResult<Eigen::Matrix3d> firstSafetyOrientation(
+        Eigen::Matrix3d orientationWithoutTilt(
+            const PublishedTrajectoryPlan& plan,
+            const TrajectoryPosePoint& point)
+        {
+            return TrajectoryPlanner::levelSprayAxisAroundLocalY(
+                (plan.baseFromPlanning * point.planningFromTool).linear());
+        }
+
+        PlanningResult<Eigen::Matrix3d> safetyOrientation(
             const PublishedTrajectoryPlan& plan,
             std::size_t safetyIndex)
         {
@@ -90,17 +99,24 @@ namespace smrobot::spray::rotationbody
                 ++index) {
                 if(const TrajectoryPass* pass =
                     sequencePass(plan, plan.executionSequence[index])) {
-                    if(pass->trajectory.hasValidPoints()) {
-                        return PlanningResult<Eigen::Matrix3d>::success(
-                            (plan.baseFromPlanning *
-                                pass->trajectory.linearPoints.front().planningFromTool).linear());
-                    }
+                    return PlanningResult<Eigen::Matrix3d>::success(
+                        orientationWithoutTilt(
+                            plan, pass->trajectory.linearPoints.front()));
+                }
+            }
+            for(std::size_t index = safetyIndex; index-- > 0;) {
+                if(const TrajectoryPass* pass =
+                    sequencePass(plan, plan.executionSequence[index])) {
+                    return PlanningResult<Eigen::Matrix3d>::success(
+                        orientationWithoutTilt(
+                            plan, pass->trajectory.linearPoints.back()));
                 }
             }
             return PlanningResult<Eigen::Matrix3d>::failure(
                 PlanningErrorCode::InvalidArgument,
-                "The first safety point requires a following trajectory.");
+                "A safety point requires an adjacent trajectory from which to remove tilt.");
         }
+
     }
 
     PlanningResult<TimedExecutionTargets> ExecutionSequenceBuilder::build(
@@ -133,7 +149,6 @@ namespace smrobot::spray::rotationbody
 
         double timeSeconds = 0.0;
         Eigen::Isometry3d current = initialBaseFromTool;
-        bool hasTrajectoryTarget = false;
         const TrajectoryPass* previousTrajectoryPass = nullptr;
         const auto appendTransfer = [&](
             const Eigen::Isometry3d& pose,
@@ -161,20 +176,16 @@ namespace smrobot::spray::rotationbody
             ++sequenceIndex) {
             const RapidSequenceEntry& entry = plan.executionSequence[sequenceIndex];
             if(entry.kind == RapidSequenceEntryKind::SafetyPoint) {
+                const PlanningResult<Eigen::Matrix3d> orientation =
+                    safetyOrientation(plan, sequenceIndex);
+                if(!orientation) {
+                    return PlanningResult<TimedExecutionTargets>::failure(
+                        orientation.error.code,
+                        orientation.error.message);
+                }
                 Eigen::Isometry3d safetyPose = Eigen::Isometry3d::Identity();
                 safetyPose.translation() = plan.safetyPositionBaseMeters;
-                if(hasTrajectoryTarget) {
-                    safetyPose.linear() = current.linear();
-                } else {
-                    const PlanningResult<Eigen::Matrix3d> orientation =
-                        firstSafetyOrientation(plan, sequenceIndex);
-                    if(!orientation) {
-                        return PlanningResult<TimedExecutionTargets>::failure(
-                            orientation.error.code,
-                            orientation.error.message);
-                    }
-                    safetyPose.linear() = orientation.value;
-                }
+                safetyPose.linear() = orientation.value;
                 appendTransfer(
                     safetyPose,
                     TimedExecutionTargetKind::SafetyPoint,
@@ -232,7 +243,6 @@ namespace smrobot::spray::rotationbody
                 current.linear() = *returnOrientation;
             }
             timeSeconds = passStartTime + pass->trajectory.metrics.durationSeconds;
-            hasTrajectoryTarget = true;
             previousTrajectoryPass = pass;
 
             if(pass->transitionAfterSeconds > 0.0) {

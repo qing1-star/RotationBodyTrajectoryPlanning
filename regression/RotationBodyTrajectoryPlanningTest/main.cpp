@@ -10,10 +10,13 @@
 #include <RotationBodyTrajectoryPlanning/Sectioning/ContourTopology.h>
 #include <RotationBodyTrajectoryPlanning/Sectioning/YzSectionExtractor.h>
 #include <RotationBodyTrajectoryPlanning/TrajectoryPlanning/TrajectoryEditor.h>
+#include <RotationBodyTrajectoryPlanning/TrajectoryPlanning/AutomaticTrajectoryPlanner.h>
 #include <RotationBodyTrajectoryPlanning/TrajectoryPlanning/ExecutionSequenceBuilder.h>
 #include <RotationBodyTrajectoryPlanning/TrajectoryPlanning/TrajectoryGroupEditor.h>
 #include <RotationBodyTrajectoryPlanning/TrajectoryPlanning/MergedTrajectoryTextExporter.h>
 #include <RotationBodyTrajectoryPlanning/TrajectoryPlanning/TrajectoryPlanner.h>
+#include <RotationBodyTrajectoryPlanning/TrajectoryPlanning/TrajectoryParameterTextParser.h>
+#include <RotationBodyTrajectoryPlanning/Persistence/PublishedTrajectoryPlanSprayTrajectoryAdapter.h>
 #include <CalibrationInstructionTranslation/ABBTranslation/RapidModuleGenerator.h>
 #include <CalibrationInstructionTranslation/Calibration/WorkpieceCalibration.h>
 
@@ -1188,14 +1191,33 @@ namespace
         expect(nearVector(
             trajectory.linearPoints.front().planningFromTool.linear().col(2),
             -Eigen::Vector3d::UnitY()),
-            "zero tilt points the tool Z spray axis normal to a horizontal outer edge");
+            "zero tilt points tool Z along base negative Y");
+        expect(nearVector(
+                trajectory.linearPoints.front().planningFromTool.linear().col(0),
+                -Eigen::Vector3d::UnitZ()) &&
+            nearVector(
+                trajectory.linearPoints.front().planningFromTool.linear().col(1),
+                Eigen::Vector3d::UnitX()),
+            "zero tilt points tool X down and tool Y along base positive X");
+
+        const Eigen::Matrix3d fieldTiltedOrientation =
+            Eigen::Quaterniond(0.350997, 0.000014, 0.936377, -0.000005)
+                .normalized().toRotationMatrix();
+        const Eigen::Matrix3d fieldLeveledOrientation =
+            rotationbody::TrajectoryPlanner::levelSprayAxisAroundLocalY(
+                fieldTiltedOrientation);
+        expect(std::abs(fieldLeveledOrientation.col(2).z()) <= 1.0e-9 &&
+                fieldLeveledOrientation.col(1).isApprox(
+                    fieldTiltedOrientation.col(1), 1.0e-9) &&
+                !fieldLeveledOrientation.isApprox(fieldTiltedOrientation, 1.0e-6),
+            "safety leveling removes the actual field spray-axis pitch around local Y");
 
         rotationbody::TrajectoryGenerationParameters tiltedParameters = parameters;
         const auto slopedZero = rotationbody::TrajectoryPlanner::generate(
             makeSlopedTrajectoryBoundary(),
             tiltedParameters);
         expect(slopedZero.ok(),
-            "sloped outer edge accepts a zero relative-normal tilt");
+            "sloped outer edge accepts a world-horizontal zero tilt");
         tiltedParameters.tiltRadians = 30.0 * std::acos(-1.0) / 180.0;
         const auto tilted = rotationbody::TrajectoryPlanner::generate(
             makeSlopedTrajectoryBoundary(),
@@ -1204,38 +1226,24 @@ namespace
             "sloped outer edge accepts a local-Y trajectory tilt");
         if(tilted)
         {
-            const Eigen::Vector3d edgeTangent =
-                (Eigen::Vector3d(0.0, 0.02, 0.0) -
-                    Eigen::Vector3d(0.0, 0.025, 0.01)).normalized();
-            Eigen::Vector3d expectedNormal(
-                0.0,
-                -edgeTangent.z(),
-                edgeTangent.y());
-            expectedNormal.normalize();
-            if(expectedNormal.y() > 0.0) expectedNormal = -expectedNormal;
-            const Eigen::Vector3d expectedY =
-                expectedNormal.cross(edgeTangent).normalized();
-            const Eigen::Vector3d expectedSpray =
-                Eigen::AngleAxisd(tiltedParameters.tiltRadians, expectedY) *
-                expectedNormal;
+            const Eigen::Matrix3d expectedOrientation =
+                rotationbody::TrajectoryPlanner::baseFromToolAtZeroTilt() *
+                Eigen::AngleAxisd(
+                    tiltedParameters.tiltRadians,
+                    Eigen::Vector3d::UnitY()).toRotationMatrix();
             if(slopedZero)
             {
-                const Eigen::Vector3d zeroSpray =
-                    slopedZero.value.linearPoints.front().planningFromTool.linear().col(2);
-                expect(near(zeroSpray.dot(edgeTangent), 0.0, 1.0e-9) &&
-                    zeroSpray.y() < 0.0,
-                    "zero tilt is perpendicular to the fitted edge and points into the workpiece");
-                expect(near(
-                    std::acos(std::clamp(zeroSpray.dot(expectedSpray), -1.0, 1.0)),
-                    tiltedParameters.tiltRadians,
-                    1.0e-9) && expectedSpray.z() < zeroSpray.z(),
+                expect(slopedZero.value.linearPoints.front().planningFromTool.linear().isApprox(
+                        rotationbody::TrajectoryPlanner::baseFromToolAtZeroTilt(),
+                        1.0e-9),
+                    "sloped geometry does not change the world-horizontal zero-tilt pose");
+                expect(expectedOrientation.col(2).z() < 0.0,
                     "positive tilt rotates the spray Z axis downward around local Y");
             }
-            expect(nearVector(
-                tilted.value.linearPoints.front().planningFromTool.linear().col(2),
-                expectedSpray,
-                1.0e-9),
-                "tilt is measured from the fitted outer-edge normal");
+            expect(tilted.value.linearPoints.front().planningFromTool.linear().isApprox(
+                    expectedOrientation,
+                    1.0e-9),
+                "tilt is measured from the fixed base-coordinate zero pose");
 
             tiltedParameters.reversed = true;
             const auto reversedTilted = rotationbody::TrajectoryPlanner::generate(
@@ -1247,7 +1255,7 @@ namespace
             {
                 expect(nearVector(
                     reversedTilted.value.linearPoints.front().planningFromTool.linear().col(2),
-                    expectedSpray,
+                    expectedOrientation.col(2),
                     1.0e-9),
                     "swapping A/B preserves the physical spray direction");
                 expect(
@@ -1260,6 +1268,60 @@ namespace
                     "reversing generation preserves the complete tool orientation");
             }
         }
+
+        Eigen::Isometry3d baseFromPlanning = Eigen::Isometry3d::Identity();
+        baseFromPlanning.linear() = Eigen::AngleAxisd(
+            0.4,
+            Eigen::Vector3d::UnitZ()).toRotationMatrix();
+        const auto worldAligned = rotationbody::TrajectoryPlanner::generate(
+            makeSlopedTrajectoryBoundary(),
+            parameters,
+            baseFromPlanning);
+        expect(worldAligned.ok() &&
+            (baseFromPlanning * worldAligned.value.linearPoints.front().planningFromTool)
+                .linear().isApprox(
+                    rotationbody::TrajectoryPlanner::baseFromToolAtZeroTilt(),
+                    1.0e-9),
+            "zero tilt remains aligned to base axes after workpiece calibration");
+
+        rotationbody::TrajectoryGenerationParameters boundaryParameters = parameters;
+        boundaryParameters.sprayDistanceMeters =
+            rotationbody::TrajectoryPlanner::minimumSprayDistanceMeters;
+        boundaryParameters.tiltRadians =
+            rotationbody::TrajectoryPlanner::maximumAbsoluteTiltRadians;
+        const auto lowerDistanceUpperTilt = rotationbody::TrajectoryPlanner::generate(
+            makeTrajectoryBoundary(),
+            boundaryParameters);
+        boundaryParameters.sprayDistanceMeters =
+            rotationbody::TrajectoryPlanner::maximumSprayDistanceMeters;
+        boundaryParameters.tiltRadians =
+            -rotationbody::TrajectoryPlanner::maximumAbsoluteTiltRadians;
+        const auto upperDistanceLowerTilt = rotationbody::TrajectoryPlanner::generate(
+            makeTrajectoryBoundary(),
+            boundaryParameters);
+        expect(lowerDistanceUpperTilt.ok() && upperDistanceLowerTilt.ok(),
+            "trajectory generation accepts the inclusive distance and tilt limits");
+        boundaryParameters.sprayDistanceMeters =
+            rotationbody::TrajectoryPlanner::minimumSprayDistanceMeters - 0.001;
+        expect(!rotationbody::TrajectoryPlanner::generate(
+                makeTrajectoryBoundary(), boundaryParameters).ok(),
+            "trajectory generation rejects spray distance below negative 100 mm");
+        boundaryParameters.sprayDistanceMeters =
+            rotationbody::TrajectoryPlanner::maximumSprayDistanceMeters + 0.001;
+        expect(!rotationbody::TrajectoryPlanner::generate(
+                makeTrajectoryBoundary(), boundaryParameters).ok(),
+            "trajectory generation rejects spray distance above 9999 mm");
+        boundaryParameters.sprayDistanceMeters = parameters.sprayDistanceMeters;
+        boundaryParameters.tiltRadians =
+            rotationbody::TrajectoryPlanner::maximumAbsoluteTiltRadians + 0.001;
+        expect(!rotationbody::TrajectoryPlanner::generate(
+                makeTrajectoryBoundary(), boundaryParameters).ok(),
+            "trajectory generation rejects tilt above positive 999 degrees");
+        boundaryParameters.tiltRadians =
+            -rotationbody::TrajectoryPlanner::maximumAbsoluteTiltRadians - 0.001;
+        expect(!rotationbody::TrajectoryPlanner::generate(
+                makeTrajectoryBoundary(), boundaryParameters).ok(),
+            "trajectory generation rejects tilt below negative 999 degrees");
         bool timestampsMatch = true;
         for(std::size_t index = 0; index < trajectory.linearPoints.size(); ++index)
         {
@@ -1314,6 +1376,128 @@ namespace
             "pose adjustment affects only explicitly selected indices");
     }
 
+    void testAutomaticTrajectoryPlanningAndParameterText()
+    {
+        constexpr double pi = 3.14159265358979323846;
+        rotationbody::SectionContour contour;
+        contour.closed = true;
+        contour.pointsYz = {
+            { 0.0, 0.0 },
+            { 1.2, 0.0 },
+            { 1.2, 1.0 },
+            { 1.0, 1.0 },
+            { 1.0, 2.0 },
+            { 1.2, 2.0 },
+            { 1.2, 3.0 },
+            { 0.0, 3.0 }
+        };
+        rotationbody::RegionAssignment regions;
+        regions.segmentLabels = {
+            rotationbody::RegionLabel::Transition,
+            rotationbody::RegionLabel::ToothTop,
+            rotationbody::RegionLabel::ToothWall,
+            rotationbody::RegionLabel::ToothBottom,
+            rotationbody::RegionLabel::ToothWall,
+            rotationbody::RegionLabel::ToothTop,
+            rotationbody::RegionLabel::Transition,
+            rotationbody::RegionLabel::Unclassified
+        };
+        regions.segmentConfidence.assign(regions.segmentLabels.size(), 1.0);
+
+        const auto dual = rotationbody::AutomaticTrajectoryPlanner::plan(
+            contour,
+            regions,
+            rotationbody::AutomaticTrajectoryMode::Dual);
+        expect(dual.ok() && dual.value.trajectories.size() == 2,
+            "automatic dual planning returns two trajectories");
+        if(dual) {
+            const double expectedLimit = std::atan2(0.2, 0.5);
+            expect(near(dual.value.upperWallNormalAngleRadians, 0.5 * pi) &&
+                    near(dual.value.lowerWallNormalAngleRadians, -0.5 * pi),
+                "wall regions are split by +Z upper and -Z lower outward normals");
+            expect(near(dual.value.toothTopNormalAngleRadians, 0.0) &&
+                    near(dual.value.toothBottomNormalAngleRadians, 0.0),
+                "top and bottom region normals use their length-weighted means");
+            expect(near(dual.value.dualTiltLimitRadians, expectedLimit) &&
+                    near(dual.value.trajectories[0].tiltRadians, expectedLimit) &&
+                    near(dual.value.trajectories[1].tiltRadians, -expectedLimit),
+                "dual weighted tilts are clamped by the nearest top-to-bottom angle");
+            for(const auto& parameters : dual.value.trajectories) {
+                expect(near(parameters.sprayDistanceMeters, 0.110) &&
+                        near(parameters.speedMetersPerSecond, 0.004) &&
+                        near(parameters.startExtensionMeters, 0.015) &&
+                        near(parameters.endExtensionMeters, 0.015) &&
+                        near(parameters.positionerRpm, 65.0),
+                    "automatic trajectories use the requested fixed process parameters");
+            }
+        }
+
+        const auto triple = rotationbody::AutomaticTrajectoryPlanner::plan(
+            contour,
+            regions,
+            rotationbody::AutomaticTrajectoryMode::Triple);
+        expect(triple.ok() && triple.value.trajectories.size() == 3,
+            "automatic triple planning returns three trajectories");
+        if(triple) {
+            expect(near(triple.value.trajectories[0].tiltRadians, 0.25 * pi) &&
+                    near(triple.value.trajectories[1].tiltRadians, -0.25 * pi) &&
+                    near(triple.value.trajectories[2].tiltRadians, 0.0),
+                "triple tilts use 50/50 wall-top means and the bottom mean without clamping");
+        }
+
+        rotationbody::SectionContour repeatedContour;
+        repeatedContour.closed = true;
+        repeatedContour.pointsYz = {
+            { 0.0, 0.0 }, { 1.2, 0.0 }, { 1.2, 1.0 }, { 1.0, 1.0 },
+            { 1.0, 2.0 }, { 1.2, 2.0 }, { 1.2, 3.0 }, { 1.05, 3.0 },
+            { 1.05, 4.0 }, { 1.2, 4.0 }, { 1.2, 5.0 }, { 0.0, 5.0 }
+        };
+        rotationbody::RegionAssignment repeatedRegions;
+        repeatedRegions.segmentLabels = {
+            rotationbody::RegionLabel::Transition,
+            rotationbody::RegionLabel::ToothTop,
+            rotationbody::RegionLabel::ToothWall,
+            rotationbody::RegionLabel::ToothBottom,
+            rotationbody::RegionLabel::ToothWall,
+            rotationbody::RegionLabel::ToothTop,
+            rotationbody::RegionLabel::ToothWall,
+            rotationbody::RegionLabel::ToothBottom,
+            rotationbody::RegionLabel::ToothWall,
+            rotationbody::RegionLabel::ToothTop,
+            rotationbody::RegionLabel::Transition,
+            rotationbody::RegionLabel::Unclassified
+        };
+        repeatedRegions.segmentConfidence.assign(
+            repeatedRegions.segmentLabels.size(),
+            1.0);
+        const auto repeatedDual = rotationbody::AutomaticTrajectoryPlanner::plan(
+            repeatedContour,
+            repeatedRegions,
+            rotationbody::AutomaticTrajectoryMode::Dual);
+        expect(repeatedDual.ok() &&
+                near(repeatedDual.value.dualTiltLimitRadians, std::atan2(0.15, 0.5)),
+            "multiple tooth bottoms use the most restrictive local coverage angle");
+
+        const auto parsed = rotationbody::TrajectoryParameterTextParser::parse(
+            "110\n30\n4\n20\n20\n65\n\n110\n-30\n4\n20\n20\n65\n");
+        expect(parsed.ok() && parsed.value.size() == 2,
+            "six-value TXT blocks parse as separate trajectory parameters");
+        if(parsed && parsed.value.size() == 2) {
+            expect(near(parsed.value[0].sprayDistanceMeters, 0.110) &&
+                    near(parsed.value[0].tiltRadians, pi / 6.0) &&
+                    near(parsed.value[1].tiltRadians, -pi / 6.0) &&
+                    near(parsed.value[1].speedMetersPerSecond, 0.004) &&
+                    near(parsed.value[1].startExtensionMeters, 0.020) &&
+                    near(parsed.value[1].positionerRpm, 65.0),
+                "TXT values retain the documented units and ordering");
+        }
+        expect(!rotationbody::TrajectoryParameterTextParser::parse("110\n30\n4\n").ok(),
+            "incomplete TXT parameter blocks are rejected");
+        expect(!rotationbody::TrajectoryParameterTextParser::parse(
+                "110\nangle\n4\n20\n20\n65\n").ok(),
+            "non-numeric TXT parameter tokens are rejected");
+    }
+
     void testTrajectoryGroupAndRapidTranslation()
     {
         rotationbody::TrajectoryGenerationParameters parameters;
@@ -1339,6 +1523,22 @@ namespace
             return;
         }
 
+        rotationbody::TrajectoryGroup incrementalTransitionGroup;
+        incrementalTransitionGroup.passes = {
+            { "trajectory-1", 1, true, 0.0, 0.0, generated.value },
+            { "trajectory-2", 2, true, 0.0, 0.0, generated.value },
+            { "trajectory-3", 3, true, 0.0, 0.0, generated.value }
+        };
+        expect(rotationbody::TrajectoryGroupEditor::setTransitionAfter(
+                incrementalTransitionGroup, "trajectory-1", 0.1).ok(),
+            "the first transition can be set before later disconnected transitions");
+        expect(near(incrementalTransitionGroup.passes[0].transitionAfterSeconds, 0.1),
+            "the first transition remains stored while the next transition is pending");
+        expect(rotationbody::TrajectoryGroupEditor::setTransitionAfter(
+                incrementalTransitionGroup, "trajectory-2", 0.2).ok() &&
+                rotationbody::TrajectoryGroupEditor::validate(incrementalTransitionGroup).ok(),
+            "independent transitions can be set incrementally before exporting the group");
+
         rotationbody::PublishedTrajectoryPlan plan;
         plan.objectId = "workpiece-1";
         plan.baseFromPlanning.translation() = Eigen::Vector3d(1.0, 2.0, 3.0);
@@ -1353,6 +1553,10 @@ namespace
             plan,
             settings,
             sequence);
+        const Eigen::Matrix3d expectedSafetyOrientation =
+            rotationbody::TrajectoryPlanner::levelSprayAxisAroundLocalY(
+                (plan.baseFromPlanning *
+                    generated.value.linearPoints.front().planningFromTool).linear());
         expect(rapid.ok(), "ABB RAPID translation accepts safety and trajectory entries");
         expect(!rotationbody::RapidModuleGenerator::generateScheme(
                 plan, settings, sequence),
@@ -1366,6 +1570,7 @@ namespace
                     std::string::npos &&
                 rapid.value.code.find("MoveJ pTraj001Start") != std::string::npos &&
                 rapid.value.code.find("MoveL pTraj001End") != std::string::npos &&
+                rapid.value.code.find("Approach") == std::string::npos &&
                 rapid.value.code.find("PERS num nTableRPM") == std::string::npos &&
                 rapid.value.code.find("PROC SprayOnce()") == std::string::npos,
                 "SprayRotation preserves the direct legacy instruction format");
@@ -1385,11 +1590,34 @@ namespace
                 "SprayRotation does not add an implicit return to each trajectory");
             expect(rapid.value.previewSteps[0].baseFromTool.translation().isApprox(
                     settings.safetyPositionBaseMeters) &&
+                rapid.value.previewSteps[0].baseFromTool.linear().isApprox(
+                    expectedSafetyOrientation,
+                    1.0e-9) &&
                 rapid.value.previewSteps[1].baseFromTool.translation().isApprox(
                     plan.baseFromPlanning *
                     generated.value.linearPoints.front().planningFromTool.translation()),
-                "RAPID preview poses use base coordinates for viewport instruction stepping");
+                "RAPID preview removes only the adjacent trajectory tilt at the safety position");
         }
+
+        rotationbody::PublishedTrajectoryPlan storedPosePlan = plan;
+        const Eigen::Matrix3d storedFieldTiltedOrientation =
+            Eigen::Quaterniond(0.350997, 0.000014, 0.936377, -0.000005)
+                .normalized().toRotationMatrix();
+        for(auto& point : storedPosePlan.group.passes.front().trajectory.linearPoints) {
+            point.planningFromTool.linear() = storedFieldTiltedOrientation;
+        }
+        storedPosePlan.group.passes.front().trajectory.parameters.tiltRadians = 0.0;
+        const auto storedPoseRapid = rotationbody::RapidModuleGenerator::generate(
+            storedPosePlan,
+            settings,
+            sequence);
+        expect(storedPoseRapid.ok() &&
+                storedPoseRapid.value.previewSteps.size() == 3 &&
+                std::abs(storedPoseRapid.value.previewSteps[0]
+                    .baseFromTool.linear().col(2).z()) <= 1.0e-9 &&
+                !storedPoseRapid.value.previewSteps[0].baseFromTool.linear().isApprox(
+                    storedPoseRapid.value.previewSteps[1].baseFromTool.linear(), 1.0e-6),
+            "RAPID safety leveling uses the stored pose even when its tilt parameter is stale");
 
         plan.safetyPositionBaseMeters = settings.safetyPositionBaseMeters;
         plan.safetySpeedMetersPerSecond = 0.05;
@@ -1417,6 +1645,10 @@ namespace
                 timedExecution.value[1].timeSeconds;
             expect(std::abs(actualTransferSeconds - expectedTransferSeconds) < 1.0e-6,
                 "execution timing derives safety transfer duration from distance and configured speed");
+            expect(timedExecution.value[1].baseFromTool.linear().isApprox(
+                    expectedSafetyOrientation,
+                    1.0e-9),
+                "motion execution removes only the adjacent trajectory tilt at safety");
             expect(timedExecution.value.front().timeSeconds == 0.0 &&
                 timedExecution.value.front().kind ==
                     rotationbody::TimedExecutionTargetKind::InitialPose,
@@ -1497,8 +1729,11 @@ namespace
         rotationbody::TrajectoryPass thirdPass = firstPass;
         thirdPass.id = "trajectory-3";
         thirdPass.order = 3;
+        thirdPass.trajectory.parameters.tiltRadians += 0.2;
         for(auto& point : thirdPass.trajectory.linearPoints) {
             point.planningFromTool.translation().z() -= 0.1;
+            point.planningFromTool.linear() *=
+                Eigen::AngleAxisd(0.2, Eigen::Vector3d::UnitY()).toRotationMatrix();
         }
         rotationbody::TrajectoryPass fourthPass = thirdPass;
         fourthPass.id = "trajectory-4";
@@ -1527,6 +1762,8 @@ namespace
             completePlan, settings, completeSequence);
         expect(completeRapid.ok(),
             "ABB translation accepts safety-1-2-safety-3-4 repetition order");
+        expect(completeRapid && completeRapid.value.previewSteps.size() == 10,
+            "SprayRotation preview contains no trajectory approach targets");
         if(completeRapid && completeRapid.value.previewSteps.size() == 10) {
             const std::string& code = completeRapid.value.code;
             const std::size_t safety1 = code.find("MoveJ pSafe001");
@@ -1536,20 +1773,43 @@ namespace
             const std::size_t pass3 = code.find("MoveJ pTraj003Start");
             const std::size_t pass4 = code.find("MoveJ pTraj004Start");
             expect(safety1 < pass1 && pass1 < pass2 && pass2 < safety2 &&
-                safety2 < pass3 && pass3 < pass4,
-                "SprayRotation preserves safety-1-2-safety-3-4 instruction order");
+                safety2 < pass3 && pass3 < pass4 &&
+                code.find("Approach") == std::string::npos,
+                "SprayRotation moves directly from each safety point to the trajectory start");
+            const Eigen::Matrix3d expectedThirdSafetyOrientation =
+                rotationbody::TrajectoryPlanner::levelSprayAxisAroundLocalY(
+                    (completePlan.baseFromPlanning *
+                        thirdPass.trajectory.linearPoints.front().planningFromTool).linear());
             expect(completeRapid.value.previewSteps[2].baseFromTool.linear().isApprox(
                     completeRapid.value.previewSteps[3].baseFromTool.linear(), 1.0e-9) &&
                 completeRapid.value.previewSteps[2].baseFromTool.linear().isApprox(
-                    completeRapid.value.previewSteps[4].baseFromTool.linear(), 1.0e-9) &&
-                completeRapid.value.previewSteps[7].baseFromTool.linear().isApprox(
+                    completeRapid.value.previewSteps[4].baseFromTool.linear(), 1.0e-9),
+                "the first reversed pass keeps its forward orientation");
+            expect(completeRapid.value.previewSteps[5].baseFromTool.translation().isApprox(
+                    settings.safetyPositionBaseMeters, 1.0e-9),
+                "the second safety target keeps the configured base XYZ");
+            expect(completeRapid.value.previewSteps[5].baseFromTool.linear().isApprox(
+                    expectedThirdSafetyOrientation, 1.0e-9) &&
+                !completeRapid.value.previewSteps[5].baseFromTool.linear().isApprox(
+                    completeRapid.value.previewSteps[6].baseFromTool.linear(), 1.0e-9),
+                "the second safety target removes only the next pair tilt");
+            expect(completeRapid.value.previewSteps[7].baseFromTool.linear().isApprox(
                     completeRapid.value.previewSteps[8].baseFromTool.linear(), 1.0e-9) &&
                 completeRapid.value.previewSteps[7].baseFromTool.linear().isApprox(
                     completeRapid.value.previewSteps[9].baseFromTool.linear(), 1.0e-9),
-                "both reversed passes return along the line without changing tool orientation");
+                "the second reversed pass keeps its forward orientation");
+        }
+        rotationbody::PublishedTrajectoryPlan schemePlan = completePlan;
+        const Eigen::Matrix3d schemeFirstPairTilt =
+            Eigen::AngleAxisd(0.15, Eigen::Vector3d::UnitY()).toRotationMatrix();
+        for(std::size_t passIndex = 0; passIndex < 2; ++passIndex) {
+            schemePlan.group.passes[passIndex].trajectory.parameters.tiltRadians += 0.15;
+            for(auto& point : schemePlan.group.passes[passIndex].trajectory.linearPoints) {
+                point.planningFromTool.linear() *= schemeFirstPairTilt;
+            }
         }
         const auto schemeRapid = rotationbody::RapidModuleGenerator::generateScheme(
-            completePlan, settings, completeSequence);
+            schemePlan, settings, completeSequence);
         expect(schemeRapid.ok(),
             "SprayScheme accepts two forward/return trajectory pairs");
         if(schemeRapid) {
@@ -1558,20 +1818,29 @@ namespace
             const std::size_t initialSafety = code.find(
                 "MoveJ pSafe01In,vSafeCustom,fine,penqiang;", main);
             const std::size_t startTable = code.find("StartTable;", main);
+            const std::size_t sprayFirst = code.find("PROC SprayFirst()");
             const std::size_t sprayOnce = code.find("PROC SprayOnce()");
-            const std::size_t pair1Start = code.find("MoveJ pPass01Start", sprayOnce);
+            const std::size_t firstPair1Start = code.find(
+                "MoveJ pPass01Start", sprayFirst);
+            const std::size_t pair1Start = code.find("pPass01Start", sprayOnce);
             const std::size_t pair1End = code.find("MoveL pPass01End", sprayOnce);
             const std::size_t pair1Return = code.find("MoveL pPass01Return", sprayOnce);
             const std::size_t pair1Out = code.find("MoveJ pSafe01Out", sprayOnce);
             const std::size_t pair2In = code.find("MoveJ pSafe02In", sprayOnce);
+            const std::size_t pair2Start = code.find("MoveJ pPass02Start", sprayOnce);
             expect(code.find("MODULE SprayScheme") != std::string::npos &&
                 code.find("VAR speeddata vSpray01") != std::string::npos &&
                 code.find("VAR speeddata vSpray02") != std::string::npos &&
                 initialSafety < startTable &&
-                pair1Start < pair1End && pair1End < pair1Return &&
-                pair1Return < pair1Out && pair1Out < pair2In &&
+                sprayFirst < sprayOnce &&
+                sprayFirst < firstPair1Start &&
+                firstPair1Start < sprayOnce &&
+                pair1Start < pair1End &&
+                pair1End < pair1Return && pair1Return < pair1Out &&
+                pair1Out < pair2In && pair2In < pair2Start &&
+                code.find("Approach") == std::string::npos &&
                 code.find("\\WObj:=wobj0") == std::string::npos,
-                "SprayScheme emits the requested table loop and paired return format");
+                "SprayScheme emits direct safety-to-start moves without approach targets");
         }
         returnPlan.safetyPositionBaseMeters = settings.safetyPositionBaseMeters;
         returnPlan.safetySpeedMetersPerSecond = 0.05;
@@ -1598,6 +1867,9 @@ namespace
             expect(safetyTarget != timedReturn.value.end() &&
                 safetyTarget != timedReturn.value.begin() &&
                 safetyTarget + 1 != timedReturn.value.end() &&
+                safetyTarget->baseFromTool.linear().isApprox(
+                    expectedSafetyOrientation,
+                    1.0e-9) &&
                 safetyTarget->timeSeconds > (safetyTarget - 1)->timeSeconds &&
                 (safetyTarget + 1)->timeSeconds > safetyTarget->timeSeconds,
                 "middle safety transfers have positive durations on both sides");
@@ -1670,6 +1942,94 @@ namespace
         expect(formatted.value.find("\n0.000000\n\n") != std::string::npos &&
                 formatted.value.find("\n1.000000\n") != std::string::npos,
             "text export writes each trajectory timestamp after its matrix");
+        plan.group.cycleCount = 2;
+        const auto repeated = rotationbody::MergedTrajectoryTextExporter::format(plan);
+        expect(repeated.ok() &&
+                repeated.value.find("\n1.001000\n") != std::string::npos &&
+                repeated.value.find("\n2.001000\n") != std::string::npos,
+            "text export repeats the whole group with increasing timestamps");
+    }
+
+    void testPublishedPlanCoatingTrajectoryConversion()
+    {
+        rotationbody::PlannedTrajectory trajectory;
+        trajectory.parameters.positionerRpm = 30.0;
+        trajectory.parameters.sprayDistanceMeters = 0.12;
+        rotationbody::TrajectoryPosePoint first;
+        first.timeSeconds = 0.0;
+        first.planningFromTool.translation() = Eigen::Vector3d(0.2, 0.0, 0.1);
+        rotationbody::TrajectoryPosePoint second = first;
+        second.timeSeconds = 1.0;
+        second.planningFromTool.translation() = Eigen::Vector3d(0.2, 0.0, 0.3);
+        trajectory.linearPoints = { first, second };
+        expect(rotationbody::TrajectoryEditor::rebuildDerived(trajectory).ok(),
+            "helical trajectory can be rebuilt for coating conversion");
+
+        rotationbody::TrajectoryGroup group;
+        group.passes.push_back({ "pass-1", 1, true, 0.0, 0.25, trajectory });
+        group.passes.push_back({ "pass-2", 2, true, 0.0, 0.0, trajectory });
+        expect(rotationbody::TrajectoryGroupEditor::refreshSchedule(group).ok(),
+            "coating conversion fixture can be scheduled");
+
+        rotationbody::PublishedTrajectoryPlan plan;
+        plan.objectId = "fixture";
+        plan.baseFromPlanning.translation() = Eigen::Vector3d(1.0, -2.0, 0.5);
+        plan.group = group;
+        std::string error;
+        const auto converted =
+            rotationbody::PublishedTrajectoryPlanSprayTrajectoryAdapter::convert(plan, &error);
+        expect(converted.has_value(), "saved trajectory plan converts for coating prediction");
+        if(!converted.has_value()) {
+            return;
+        }
+        expect(converted->segments.size() == 2,
+            "every saved trajectory pass remains a separate coating segment");
+        if(converted->segments.size() < 2) {
+            return;
+        }
+
+        const auto& firstSegment = converted->segments.front();
+        const auto& sourcePass = plan.group.passes.front();
+        expect(firstSegment.points.size() == 4,
+            "a scheduled gap receives non-spraying transition guards");
+        const Eigen::Isometry3d expectedPose = plan.baseFromPlanning *
+            sourcePass.trajectory.relativeHelicalPoints[1].planningFromTool;
+        expect((firstSegment.points[1].tcpPose.matrix() - expectedPose.matrix()).norm() <= 1.0e-12,
+            "coating conversion keeps the base-frame helical matrix");
+        expect(near(firstSegment.points[1].time,
+                sourcePass.startOffsetSeconds +
+                    sourcePass.trajectory.relativeHelicalPoints[1].timeSeconds),
+            "coating conversion keeps the global helical timestamp");
+        expect(nearVector(firstSegment.points[1].targetNormal,
+                expectedPose.linear().col(2)),
+            "coating conversion defines the matrix local Z axis as spray direction");
+        expect(!firstSegment.points[2].sprayEnabled && !firstSegment.points[3].sprayEnabled,
+            "pass transition guards disable spray before the next pass");
+        expect(!sourcePass.trajectory.relativeHelicalPoints[1].planningFromTool.matrix().isApprox(
+                sourcePass.trajectory.linearPoints[1].planningFromTool.matrix(), 1.0e-12),
+            "coating conversion fixture has a positioner-derived helical pose distinct from linear motion");
+        plan.group.cycleCount = 2;
+        const auto repeated =
+            rotationbody::PublishedTrajectoryPlanSprayTrajectoryAdapter::convert(plan, &error);
+        expect(repeated.has_value() && repeated->segments.size() == 4,
+            "coating conversion repeats every logical pass for each group cycle");
+        if(repeated && repeated->segments.size() == 4) {
+            expect(repeated->segments[1].points.size() == 4 &&
+                    !repeated->segments[1].points[2].sprayEnabled &&
+                    !repeated->segments[1].points[3].sprayEnabled,
+                "group cycle boundary turns off the spray gun");
+            expect(near(repeated->segments[2].points[0].time, 2.251),
+                "group cycle restarts after the previous pass and its boundary interval");
+        }
+        plan.group.passes.back().transitionAfterSeconds = 0.5;
+        const auto delayed =
+            rotationbody::PublishedTrajectoryPlanSprayTrajectoryAdapter::convert(plan, &error);
+        expect(delayed && delayed->segments.size() == 4 &&
+                near(delayed->segments[2].points[0].time, 2.75),
+            "the configured interval after the last pass separates full group cycles");
+        plan.group.cycleCount = 0;
+        expect(!rotationbody::PublishedTrajectoryPlanSprayTrajectoryAdapter::convert(plan),
+            "invalid group cycle count is rejected");
     }
 }
 
@@ -1700,8 +2060,10 @@ int main(int argc, char** argv)
     if(argc > 1 && std::string(argv[1]) == "--trajectory-only")
     {
         testTrajectoryPlanningAndEditing();
+        testAutomaticTrajectoryPlanningAndParameterText();
         testTrajectoryGroupAndRapidTranslation();
         testMergedTrajectoryTextExport();
+        testPublishedPlanCoatingTrajectoryConversion();
         if (failureCount != 0)
         {
             std::cerr << failureCount << " trajectory regression checks failed.\n";
@@ -1722,8 +2084,10 @@ int main(int argc, char** argv)
     testSprayBoundaries();
     testWorkpieceCalibration();
     testTrajectoryPlanningAndEditing();
+    testAutomaticTrajectoryPlanningAndParameterText();
     testTrajectoryGroupAndRapidTranslation();
     testMergedTrajectoryTextExport();
+    testPublishedPlanCoatingTrajectoryConversion();
 
     if (failureCount != 0)
     {

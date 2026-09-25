@@ -82,6 +82,7 @@ namespace smrobot::spray::rotationbody
     struct TrajectoryGroup
     {
         std::vector<TrajectoryPass> passes;
+        std::size_t cycleCount{ 1 };
     };
 
     enum class TrajectoryDisplayMode
@@ -104,6 +105,13 @@ namespace smrobot::spray::rotationbody
         int schemaVersion{ 1 };
         std::string objectId;
         Eigen::Isometry3d baseFromPlanning = Eigen::Isometry3d::Identity();
+        // These optional fields were added for consumers that need to
+        // evaluate predicted coating statistics per planned tooth region.
+        // They remain optional so schema-v1 plans stay usable by legacy
+        // trajectory consumers.
+        Eigen::Isometry3d planningFromMesh = Eigen::Isometry3d::Identity();
+        std::optional<SectionContour> section;
+        std::optional<RegionAssignment> regions;
         TrajectoryGroup group;
         Eigen::Vector3d safetyPositionBaseMeters = Eigen::Vector3d::Zero();
         double safetySpeedMetersPerSecond{ 0.2 };

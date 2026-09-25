@@ -1,4 +1,5 @@
 #include <RotationBodyTrajectoryPlanning/Persistence/PublishedTrajectoryPlanStore.h>
+#include <RotationBodyTrajectoryPlanning/Persistence/PublishedTrajectoryPlanContract.h>
 
 #include <nlohmann/json.hpp>
 
@@ -31,6 +32,48 @@ namespace smrobot::spray::rotationbody
                     matrix(row, column) = value.at(row * 4 + column).get<double>();
             Eigen::Isometry3d result = Eigen::Isometry3d::Identity();
             result.matrix() = matrix;
+            return result;
+        }
+
+        RegionLabel regionLabel(const std::string& value)
+        {
+            if(value == "unclassified") return RegionLabel::Unclassified;
+            if(value == "toothTop") return RegionLabel::ToothTop;
+            if(value == "toothWall") return RegionLabel::ToothWall;
+            if(value == "toothBottom") return RegionLabel::ToothBottom;
+            if(value == "transition") return RegionLabel::Transition;
+            throw std::runtime_error("Unknown region label.");
+        }
+
+        SectionContour section(const Json& value)
+        {
+            SectionContour result;
+            for(const Json& point : value.at("pointsYz")) {
+                result.pointsYz.push_back(vector2(point));
+            }
+            for(const Json& point : value.at("points3d")) {
+                result.points3d.push_back(vector3(point));
+            }
+            result.cumulativeArcLength = value.at("cumulativeArcLength")
+                .get<std::vector<double>>();
+            result.closed = value.at("closed").get<bool>();
+            result.toleranceMeters = value.at("toleranceMeters").get<double>();
+            result.diagnostics = value.value("diagnostics", std::vector<std::string>{});
+            if(result.pointsYz.size() < 2 || result.points3d.size() != result.pointsYz.size()) {
+                throw std::runtime_error("Stored section contour dimensions are invalid.");
+            }
+            return result;
+        }
+
+        RegionAssignment regions(const Json& value)
+        {
+            RegionAssignment result;
+            for(const Json& label : value.at("labels")) {
+                result.segmentLabels.push_back(regionLabel(label.get<std::string>()));
+            }
+            result.segmentConfidence = value.value(
+                "confidence", std::vector<double>{});
+            result.diagnostics = value.value("diagnostics", std::vector<std::string>{});
             return result;
         }
 
@@ -92,8 +135,28 @@ namespace smrobot::spray::rotationbody
             const Json root = Json::parse(serializedPayload);
             PublishedTrajectoryPlan result;
             result.schemaVersion = root.value("schemaVersion", 1);
+            if(result.schemaVersion < kPublishedTrajectoryPlanMinimumSchemaVersion ||
+                result.schemaVersion > kPublishedTrajectoryPlanSchemaVersion) {
+                throw std::runtime_error("The published trajectory plan uses an unsupported schema version.");
+            }
             result.objectId = root.at("objectId").get<std::string>();
             result.baseFromPlanning = transform(root.at("baseFromPlanning"));
+            if(root.contains("planningFromMesh")) {
+                result.planningFromMesh = transform(root.at("planningFromMesh"));
+            }
+            if(root.contains("section")) {
+                result.section = section(root.at("section"));
+            }
+            if(root.contains("regions")) {
+                result.regions = regions(root.at("regions"));
+                if(!result.section || !result.regions->matches(*result.section)) {
+                    throw std::runtime_error("Stored region assignment does not match the section contour.");
+                }
+            }
+            result.group.cycleCount = root.at("group").value("cycleCount", std::size_t{ 1 });
+            if(result.group.cycleCount < 1 || result.group.cycleCount > 100) {
+                throw std::runtime_error("The saved trajectory group has an invalid cycle count.");
+            }
             for(const Json& item : root.at("group").at("passes")) {
                 TrajectoryPass pass;
                 pass.id = item.at("id").get<std::string>();

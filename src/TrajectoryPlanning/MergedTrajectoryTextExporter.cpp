@@ -62,17 +62,32 @@ namespace smrobot::spray::rotationbody
         std::ostringstream stream;
         stream.imbue(std::locale::classic());
         bool firstPoint = true;
-        for(const TrajectoryPass& pass : plan.group.passes) {
+        const double cyclePeriod = TrajectoryGroupEditor::cyclePeriodSeconds(plan.group);
+        if(!std::isfinite(cyclePeriod)) {
+            return PlanningResult<std::string>::failure(
+                PlanningErrorCode::InvalidArgument,
+                "The trajectory group has an invalid cycle duration.");
+        }
+        for(std::size_t cycle = 0; cycle < plan.group.cycleCount; ++cycle) {
+          for(const TrajectoryPass& pass : plan.group.passes) {
             for(const TrajectoryPosePoint& point : pass.trajectory.relativeHelicalPoints) {
                 if(!firstPoint) {
                     stream << '\n';
                 }
+                const double timestampSeconds = cycle * cyclePeriod +
+                    pass.startOffsetSeconds + point.timeSeconds;
+                if(!std::isfinite(timestampSeconds)) {
+                    return PlanningResult<std::string>::failure(
+                        PlanningErrorCode::InvalidArgument,
+                        "The repeated trajectory timestamp is invalid.");
+                }
                 appendPose(
                     stream,
                     plan.baseFromPlanning * point.planningFromTool,
-                    pass.startOffsetSeconds + point.timeSeconds);
+                    timestampSeconds);
                 firstPoint = false;
             }
+          }
         }
         if(firstPoint) {
             return PlanningResult<std::string>::failure(

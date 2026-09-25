@@ -29,6 +29,7 @@ namespace smrobot::spray::rotationbody
             const TrajectoryGroup& group,
             const std::string& passId) noexcept;
         static PlanningResult<void> refreshSchedule(TrajectoryGroup& group);
+        static double cyclePeriodSeconds(const TrajectoryGroup& group) noexcept;
         static PlanningResult<void> validate(
             const TrajectoryGroup& group,
             double zeroIntervalPositionToleranceMeters = 1.0e-4);
