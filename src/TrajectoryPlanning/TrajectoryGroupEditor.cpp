@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <iterator>
 #include <set>
 
 namespace smrobot::spray::rotationbody
@@ -115,19 +116,36 @@ namespace smrobot::spray::rotationbody
                 PlanningErrorCode::InvalidArgument,
                 "Trajectory transition time must be finite and non-negative.");
         }
-        TrajectoryPass* pass = findMutable(group, passId);
-        if(pass == nullptr) {
+        const auto found = std::find_if(
+            group.passes.begin(),
+            group.passes.end(),
+            [&](const TrajectoryPass& pass) { return pass.id == passId; });
+        if(found == group.passes.end()) {
             return PlanningResult<void>::failure(
                 PlanningErrorCode::InvalidArgument,
                 "The trajectory transition target does not exist.");
         }
-        const double previous = pass->transitionAfterSeconds;
-        pass->transitionAfterSeconds = seconds;
-        PlanningResult<void> validation = validate(group, zeroIntervalPositionToleranceMeters);
-        if(!validation) {
-            pass->transitionAfterSeconds = previous;
-            return validation;
+
+        const std::size_t passIndex = static_cast<std::size_t>(
+            std::distance(group.passes.begin(), found));
+        if(seconds == 0.0 && passIndex + 1 < group.passes.size()) {
+            const TrajectoryPass& nextPass = group.passes[passIndex + 1];
+            if(!found->trajectory.hasValidPoints() || !nextPass.trajectory.hasValidPoints()) {
+                return PlanningResult<void>::failure(
+                    PlanningErrorCode::InvalidArgument,
+                    "A zero transition requires valid adjacent trajectories.");
+            }
+            const Eigen::Vector3d previousEnd =
+                found->trajectory.linearPoints.back().planningFromTool.translation();
+            const Eigen::Vector3d nextStart =
+                nextPass.trajectory.linearPoints.front().planningFromTool.translation();
+            if((previousEnd - nextStart).norm() > zeroIntervalPositionToleranceMeters) {
+                return PlanningResult<void>::failure(
+                    PlanningErrorCode::InvalidArgument,
+                    "A zero transition requires coincident positions between adjacent passes.");
+            }
         }
+        found->transitionAfterSeconds = seconds;
         return refreshSchedule(group);
     }
 
@@ -160,10 +178,23 @@ namespace smrobot::spray::rotationbody
         return PlanningResult<void>::success();
     }
 
+    double TrajectoryGroupEditor::cyclePeriodSeconds(const TrajectoryGroup& group) noexcept
+    {
+        if(group.passes.empty()) return 0.0;
+        const TrajectoryPass& last = group.passes.back();
+        return last.startOffsetSeconds + last.trajectory.metrics.durationSeconds +
+            std::max(last.transitionAfterSeconds, 1.0e-3);
+    }
+
     PlanningResult<void> TrajectoryGroupEditor::validate(
         const TrajectoryGroup& group,
         double zeroIntervalPositionToleranceMeters)
     {
+        if(group.cycleCount < 1 || group.cycleCount > 100) {
+            return PlanningResult<void>::failure(
+                PlanningErrorCode::InvalidArgument,
+                "Trajectory group cycle count must be between 1 and 100.");
+        }
         std::set<std::string> ids;
         for(std::size_t index = 0; index < group.passes.size(); ++index) {
             const TrajectoryPass& pass = group.passes[index];

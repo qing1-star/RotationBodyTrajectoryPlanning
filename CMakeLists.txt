@@ -18,13 +18,15 @@ set(SOURCES
     src/RegionPlanning/RegionEditHistory.cpp
     src/RegionPlanning/SprayBoundaryBuilder.cpp
     src/TrajectoryPlanning/TrajectoryPlanner.cpp
+    src/TrajectoryPlanning/AutomaticTrajectoryPlanner.cpp
+    src/TrajectoryPlanning/TrajectoryParameterTextParser.cpp
     src/TrajectoryPlanning/TrajectoryEditor.cpp
     src/TrajectoryPlanning/RelativeHelicalTrajectoryBuilder.cpp
+    src/TrajectoryPlanning/MergedTrajectoryTextExporter.cpp
     src/TrajectoryPlanning/TrajectoryGroupEditor.cpp
     src/TrajectoryPlanning/ExecutionSequenceBuilder.cpp
-    src/ABBTranslation/RapidModuleGenerator.cpp
-    src/Calibration/WorkpieceCalibration.cpp
     src/Persistence/PublishedTrajectoryPlanStore.cpp
+    src/Persistence/PublishedTrajectoryPlanSprayTrajectoryAdapter.cpp
 )
 
 set(INTERFACE_HEADERS
@@ -41,13 +43,16 @@ set(INTERFACE_HEADERS
     include/RotationBodyTrajectoryPlanning/RegionPlanning/SprayBoundaryBuilder.h
     include/RotationBodyTrajectoryPlanning/TrajectoryPlanning/TrajectoryTypes.h
     include/RotationBodyTrajectoryPlanning/TrajectoryPlanning/TrajectoryPlanner.h
+    include/RotationBodyTrajectoryPlanning/TrajectoryPlanning/AutomaticTrajectoryPlanner.h
+    include/RotationBodyTrajectoryPlanning/TrajectoryPlanning/TrajectoryParameterTextParser.h
     include/RotationBodyTrajectoryPlanning/TrajectoryPlanning/TrajectoryEditor.h
     include/RotationBodyTrajectoryPlanning/TrajectoryPlanning/RelativeHelicalTrajectoryBuilder.h
+    include/RotationBodyTrajectoryPlanning/TrajectoryPlanning/MergedTrajectoryTextExporter.h
     include/RotationBodyTrajectoryPlanning/TrajectoryPlanning/TrajectoryGroupEditor.h
     include/RotationBodyTrajectoryPlanning/TrajectoryPlanning/ExecutionSequenceBuilder.h
-    include/RotationBodyTrajectoryPlanning/ABBTranslation/RapidModuleGenerator.h
-    include/RotationBodyTrajectoryPlanning/Calibration/WorkpieceCalibration.h
     include/RotationBodyTrajectoryPlanning/Persistence/PublishedTrajectoryPlanStore.h
+    include/RotationBodyTrajectoryPlanning/Persistence/PublishedTrajectoryPlanContract.h
+    include/RotationBodyTrajectoryPlanning/Persistence/PublishedTrajectoryPlanSprayTrajectoryAdapter.h
 )
 
 cmake_path(SET abs_include_dir NORMALIZE "${CMAKE_CURRENT_SOURCE_DIR}/include")
@@ -65,7 +70,9 @@ target_include_directories(${TARGET_NAME}
 )
 
 target_link_libraries(${TARGET_NAME}
-    PUBLIC ${${PACKAGE_NAME}${TARGET_NAME}_RequiredLibsPublic}
+    PUBLIC
+        ${${PACKAGE_NAME}${TARGET_NAME}_RequiredLibsPublic}
+        SMRobotSpray::SprayTrajectoryCore
     PRIVATE ${${PACKAGE_NAME}${TARGET_NAME}_RequiredLibsPrivate}
 )
 

@@ -10,28 +10,7 @@ namespace smrobot::spray::rotationbody
 {
     namespace
     {
-        constexpr double pi = 3.14159265358979323846;
         constexpr double epsilon = 1.0e-12;
-
-        Eigen::Vector3d inwardOuterNormal(
-            const Eigen::Vector3d& outerEdgeTangent)
-        {
-            // The confirmed outer edge lies in the planning YZ plane.  Its
-            // in-plane normal is chosen toward the inner (minimum-Y) side of
-            // the spray boundary, so zero tilt is always normal to the edge.
-            Eigen::Vector3d normal(
-                0.0,
-                -outerEdgeTangent.z(),
-                outerEdgeTangent.y());
-            if(normal.norm() <= epsilon) {
-                return Eigen::Vector3d::Zero();
-            }
-            normal.normalize();
-            if(normal.y() > 0.0) {
-                normal = -normal;
-            }
-            return normal;
-        }
 
         bool finiteParameters(const TrajectoryGenerationParameters& parameters) noexcept
         {
@@ -44,6 +23,36 @@ namespace smrobot::spray::rotationbody
         }
     }
 
+    Eigen::Matrix3d TrajectoryPlanner::baseFromToolAtZeroTilt()
+    {
+        Eigen::Matrix3d orientation;
+        orientation.col(0) = -Eigen::Vector3d::UnitZ();
+        orientation.col(1) = Eigen::Vector3d::UnitX();
+        orientation.col(2) = -Eigen::Vector3d::UnitY();
+        return orientation;
+    }
+
+    Eigen::Matrix3d TrajectoryPlanner::levelSprayAxisAroundLocalY(
+        const Eigen::Matrix3d& baseFromTool)
+    {
+        const double toolXVertical = baseFromTool.col(0).z();
+        const double sprayAxisVertical = baseFromTool.col(2).z();
+        double correctionRadians = std::atan2(
+            -sprayAxisVertical,
+            toolXVertical);
+        constexpr double halfPi = 0.5 * 3.14159265358979323846;
+        constexpr double pi = 3.14159265358979323846;
+        if(correctionRadians > halfPi) {
+            correctionRadians -= pi;
+        } else if(correctionRadians < -halfPi) {
+            correctionRadians += pi;
+        }
+        return baseFromTool *
+            Eigen::AngleAxisd(
+                correctionRadians,
+                Eigen::Vector3d::UnitY()).toRotationMatrix();
+    }
+
     PlanningResult<std::size_t> TrajectoryPlanner::suggestedPointCount(
         double pathLengthMeters)
     {
@@ -54,10 +63,10 @@ namespace smrobot::spray::rotationbody
         }
         const double segmentCount = std::ceil(pathLengthMeters / automaticSpacingMeters);
         if(!std::isfinite(segmentCount) ||
-            segmentCount > static_cast<double>(maximumPointCount - 1)) {
+            segmentCount >= static_cast<double>(std::numeric_limits<std::size_t>::max())) {
             return PlanningResult<std::size_t>::failure(
                 PlanningErrorCode::InvalidArgument,
-                "The automatic 1 mm sampling would exceed the supported point count.");
+                "The automatic 1 mm sampling cannot be represented by the point-count type.");
         }
         return PlanningResult<std::size_t>::success(
             std::max(minimumPointCount, static_cast<std::size_t>(segmentCount) + 1));
@@ -67,11 +76,22 @@ namespace smrobot::spray::rotationbody
         const SprayBoundary& boundary,
         const TrajectoryGenerationParameters& parameters)
     {
-        if(!finiteParameters(parameters) || parameters.sprayDistanceMeters <= 0.0 ||
+        return generate(boundary, parameters, Eigen::Isometry3d::Identity());
+    }
+
+    PlanningResult<PlannedTrajectory> TrajectoryPlanner::generate(
+        const SprayBoundary& boundary,
+        const TrajectoryGenerationParameters& parameters,
+        const Eigen::Isometry3d& baseFromPlanning)
+    {
+        if(!finiteParameters(parameters) ||
+            parameters.sprayDistanceMeters < minimumSprayDistanceMeters ||
+            parameters.sprayDistanceMeters > maximumSprayDistanceMeters ||
             parameters.speedMetersPerSecond <= 0.0 ||
             parameters.startExtensionMeters < 0.0 ||
             parameters.endExtensionMeters < 0.0 ||
-            std::abs(parameters.tiltRadians) >= 80.0 * pi / 180.0) {
+            std::abs(parameters.tiltRadians) > maximumAbsoluteTiltRadians ||
+            !baseFromPlanning.matrix().allFinite()) {
             return PlanningResult<PlannedTrajectory>::failure(
                 PlanningErrorCode::InvalidArgument,
                 "Trajectory parameters are outside their supported finite ranges.");
@@ -101,15 +121,6 @@ namespace smrobot::spray::rotationbody
                 PlanningErrorCode::DegenerateGeometry,
                 "The confirmed boundary outer edge is degenerate.");
         }
-        const Eigen::Vector3d canonicalTangent = rawTangent / rawLength;
-        const Eigen::Vector3d zeroTiltSprayDirection =
-            inwardOuterNormal(canonicalTangent);
-        if(!zeroTiltSprayDirection.allFinite() ||
-            zeroTiltSprayDirection.norm() <= epsilon) {
-            return PlanningResult<PlannedTrajectory>::failure(
-                PlanningErrorCode::DegenerateGeometry,
-                "The confirmed boundary outer edge has no valid in-plane normal.");
-        }
         Eigen::Vector3d edgeA = canonicalEdgeA;
         Eigen::Vector3d edgeB = canonicalEdgeB;
         if(parameters.reversed) {
@@ -123,15 +134,17 @@ namespace smrobot::spray::rotationbody
         trajectory.targetSurfaceStart = edgeA - parameters.startExtensionMeters * tangent;
         trajectory.targetSurfaceEnd = edgeB + parameters.endExtensionMeters * tangent;
 
-        // Tilt is measured from the outer-edge normal and rotates around the
-        // trajectory frame's local Y axis.  The canonical edge orientation is
-        // used here so swapping A/B changes travel direction only, not the
-        // physical spray direction or the meaning of a positive tilt angle.
-        const Eigen::Vector3d canonicalToolY =
-            zeroTiltSprayDirection.cross(canonicalTangent).normalized();
-        const Eigen::Vector3d sprayDirection =
-            Eigen::AngleAxisd(parameters.tiltRadians, canonicalToolY) *
-            zeroTiltSprayDirection;
+        // At zero tilt, tool X/Y/Z point along base -Z/+X/-Y. Apply the
+        // requested tilt around local tool Y, then express that fixed base
+        // orientation in planning coordinates for every trajectory point.
+        const Eigen::Matrix3d baseFromTiltedTool =
+            baseFromToolAtZeroTilt() *
+            Eigen::AngleAxisd(
+                parameters.tiltRadians,
+                Eigen::Vector3d::UnitY()).toRotationMatrix();
+        const Eigen::Matrix3d planningFromTool =
+            baseFromPlanning.linear().transpose() * baseFromTiltedTool;
+        const Eigen::Vector3d sprayDirection = planningFromTool.col(2);
         const Eigen::Vector3d startPosition = trajectory.targetSurfaceStart -
             parameters.sprayDistanceMeters * sprayDirection;
         const Eigen::Vector3d endPosition = trajectory.targetSurfaceEnd -
@@ -144,26 +157,6 @@ namespace smrobot::spray::rotationbody
                 "The generated trajectory start and end positions coincide.");
         }
 
-        // Reversing a pass changes only its travel direction.  Keep the tool
-        // frame tied to the canonical boundary direction so a return pass
-        // does not introduce a 180-degree roll around the spray axis.
-        Eigen::Vector3d toolX = canonicalTangent -
-            canonicalTangent.dot(sprayDirection) * sprayDirection;
-        if(toolX.norm() <= epsilon) {
-            return PlanningResult<PlannedTrajectory>::failure(
-                PlanningErrorCode::DegenerateGeometry,
-                "The travel direction is parallel to the spray direction.");
-        }
-        toolX.normalize();
-        Eigen::Vector3d toolY = sprayDirection.cross(toolX);
-        if(toolY.norm() <= epsilon) {
-            return PlanningResult<PlannedTrajectory>::failure(
-                PlanningErrorCode::DegenerateGeometry,
-                "A right-handed trajectory frame cannot be constructed.");
-        }
-        toolY.normalize();
-        toolX = toolY.cross(sprayDirection).normalized();
-
         std::size_t pointCount = parameters.pointCount;
         if(pointCount == 0) {
             PlanningResult<std::size_t> count = suggestedPointCount(pathLength);
@@ -175,10 +168,10 @@ namespace smrobot::spray::rotationbody
             pointCount = count.value;
             trajectory.parameters.pointCount = pointCount;
         }
-        if(pointCount < minimumPointCount || pointCount > maximumPointCount) {
+        if(pointCount < minimumPointCount) {
             return PlanningResult<PlannedTrajectory>::failure(
                 PlanningErrorCode::InvalidArgument,
-                "Trajectory point count must be between 2 and 10001.");
+                "Trajectory point count must be at least 2.");
         }
 
         const double duration = pathLength / parameters.speedMetersPerSecond;
@@ -188,9 +181,7 @@ namespace smrobot::spray::rotationbody
                 static_cast<double>(pointCount - 1);
             TrajectoryPosePoint point;
             point.timeSeconds = ratio * duration;
-            point.planningFromTool.linear().col(0) = toolX;
-            point.planningFromTool.linear().col(1) = toolY;
-            point.planningFromTool.linear().col(2) = sprayDirection;
+            point.planningFromTool.linear() = planningFromTool;
             point.planningFromTool.translation() =
                 (1.0 - ratio) * startPosition + ratio * endPosition;
             trajectory.linearPoints.push_back(std::move(point));
